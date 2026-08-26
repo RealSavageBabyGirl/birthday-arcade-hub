@@ -1,0 +1,178 @@
+name: Perfect Paints Backup
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install browser tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright beautifulsoup4
+      - name: Capture Perfect Paints
+        run: |
+          cat > /tmp/capture.py <<'PY'
+          import asyncio, hashlib, json, mimetypes, re
+          from pathlib import Path
+          from urllib.parse import urlparse, urldefrag, unquote
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          ROOT = 'https://perfectpaints.co.za/'
+          HOSTS = {'perfectpaints.co.za', 'www.perfectpaints.co.za'}
+          OUT = Path('backup')
+          OUT.mkdir(parents=True, exist_ok=True)
+          seen_pages, queued = set(), [ROOT]
+          captured, errors = {}, []
+          pending_tasks = set()
+
+          def safe_path(url, content_type=''):
+              p = urlparse(url)
+              host = p.netloc or 'unknown-host'
+              path = unquote(p.path or '/')
+              if path.endswith('/'):
+                  path += 'index.html'
+              name = path.rsplit('/', 1)[-1]
+              if '.' not in name and ('text/html' in content_type or not content_type):
+                  path += '.html'
+              if p.query:
+                  stem, sep, ext = path.rpartition('.')
+                  suffix = hashlib.sha1(p.query.encode()).hexdigest()[:10]
+                  path = f'{stem or path}__q_{suffix}{sep+ext if sep else ""}'
+              path = re.sub(r'[^A-Za-z0-9._/\-]', '_', path).lstrip('/') or 'index.html'
+              return OUT / host / path
+
+          async def save_response(resp):
+              url = resp.url
+              if not url.startswith(('http://', 'https://')):
+                  return
+              try:
+                  body = await resp.body()
+              except Exception:
+                  return
+              ctype = (resp.headers.get('content-type') or '').split(';')[0]
+              path = safe_path(url, ctype)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              try:
+                  path.write_bytes(body)
+                  captured[url] = {'path': str(path), 'status': resp.status, 'content_type': ctype, 'bytes': len(body)}
+              except Exception as e:
+                  errors.append({'url': url, 'error': str(e)})
+
+          def on_response(resp):
+              task = asyncio.create_task(save_response(resp))
+              pending_tasks.add(task)
+              task.add_done_callback(pending_tasks.discard)
+
+          async def seed_sitemaps(context):
+              seeds = set()
+              for sm in ('https://perfectpaints.co.za/wp-sitemap.xml', 'https://perfectpaints.co.za/sitemap_index.xml', 'https://perfectpaints.co.za/sitemap.xml'):
+                  try:
+                      r = await context.request.get(sm, timeout=15000)
+                      if r.ok:
+                          text = await r.text()
+                          p = safe_path(sm, r.headers.get('content-type',''))
+                          p.parent.mkdir(parents=True, exist_ok=True)
+                          p.write_text(text, encoding='utf-8')
+                          captured[sm] = {'path': str(p), 'status': r.status, 'content_type': r.headers.get('content-type',''), 'bytes': len(text.encode())}
+                          locs = re.findall(r'<loc>\s*(.*?)\s*</loc>', text, re.I)
+                          for loc in locs:
+                              if 'sitemap' in loc.lower() and loc != sm:
+                                  try:
+                                      sr = await context.request.get(loc, timeout=15000)
+                                      if sr.ok:
+                                          st = await sr.text()
+                                          sp = safe_path(loc, sr.headers.get('content-type',''))
+                                          sp.parent.mkdir(parents=True, exist_ok=True)
+                                          sp.write_text(st, encoding='utf-8')
+                                          captured[loc] = {'path': str(sp), 'status': sr.status, 'content_type': sr.headers.get('content-type',''), 'bytes': len(st.encode())}
+                                          for u in re.findall(r'<loc>\s*(.*?)\s*</loc>', st, re.I):
+                                              if urlparse(u).netloc in HOSTS:
+                                                  seeds.add(urldefrag(u)[0])
+                                  except Exception as e:
+                                      errors.append({'url': loc, 'error': f'sitemap: {e}'})
+                              elif urlparse(loc).netloc in HOSTS:
+                                  seeds.add(urldefrag(loc)[0])
+                  except Exception as e:
+                      errors.append({'url': sm, 'error': f'sitemap: {e}'})
+              return seeds
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True, executable_path='/usr/bin/google-chrome', args=['--no-sandbox','--disable-dev-shm-usage'])
+                  context = await browser.new_context(
+                      user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                      viewport={'width':1440,'height':1100},
+                      ignore_https_errors=True
+                  )
+                  page = await context.new_page()
+                  page.on('response', on_response)
+
+                  sitemap_urls = await seed_sitemaps(context)
+                  for u in sorted(sitemap_urls):
+                      if u not in queued:
+                          queued.append(u)
+
+                  max_pages = 250
+                  while queued and len(seen_pages) < max_pages:
+                      url = urldefrag(queued.pop(0))[0]
+                      if url in seen_pages or urlparse(url).netloc not in HOSTS:
+                          continue
+                      if re.search(r'\.(pdf|jpg|jpeg|png|gif|webp|avif|svg|zip|mp4|mp3|docx?|xlsx?|css|js|woff2?|ttf|otf)($|\?)', urlparse(url).path, re.I):
+                          continue
+                      seen_pages.add(url)
+                      try:
+                          resp = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                          await page.wait_for_timeout(1200)
+                          # Trigger lazy-loaded/background assets across the whole page.
+                          for _ in range(12):
+                              await page.evaluate('window.scrollBy(0, Math.max(700, window.innerHeight * 0.85))')
+                              await page.wait_for_timeout(180)
+                          await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                          await page.wait_for_timeout(900)
+                          await page.evaluate('window.scrollTo(0, 0)')
+                          await page.wait_for_timeout(250)
+
+                          html = await page.content()
+                          final_url = page.url
+                          pth = safe_path(final_url, 'text/html')
+                          pth.parent.mkdir(parents=True, exist_ok=True)
+                          pth.write_text(html, encoding='utf-8')
+                          captured[final_url] = {'path': str(pth), 'status': resp.status if resp else None, 'content_type':'text/html', 'bytes': len(html.encode())}
+
+                          links = await page.eval_on_selector_all('a[href]', 'els => els.map(e => e.href)')
+                          for href in links:
+                              href = urldefrag(href)[0]
+                              u = urlparse(href)
+                              if u.scheme in ('http','https') and u.netloc in HOSTS and href not in seen_pages and href not in queued:
+                                  if not re.search(r'\.(pdf|jpg|jpeg|png|gif|webp|avif|svg|zip|mp4|mp3|docx?|xlsx?)($|\?)', u.path, re.I):
+                                      queued.append(href)
+                      except Exception as e:
+                          errors.append({'url': url, 'error': str(e)})
+
+                  if pending_tasks:
+                      await asyncio.gather(*list(pending_tasks), return_exceptions=True)
+                  await browser.close()
+
+              (OUT/'capture-manifest.json').write_text(json.dumps({'pages': sorted(seen_pages), 'captured': captured, 'errors': errors}, indent=2), encoding='utf-8')
+              (OUT/'file-manifest.txt').write_text('\n'.join(sorted(str(p) for p in OUT.rglob('*') if p.is_file())), encoding='utf-8')
+              print('Pages visited:', len(seen_pages))
+              print('Resources captured:', len(captured))
+              print('Files:', sum(1 for p in OUT.rglob('*') if p.is_file()))
+              print('Errors:', len(errors))
+
+          asyncio.run(main())
+          PY
+          python /tmp/capture.py
+          zip -r perfectpaints-public-website-backup.zip backup
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perfectpaints-public-website-backup
+          path: perfectpaints-public-website-backup.zip
+          if-no-files-found: error
+          retention-days: 1

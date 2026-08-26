@@ -16,9 +16,9 @@ jobs:
       - name: Capture Perfect Paints
         run: |
           cat > /tmp/capture.py <<'PY'
-          import asyncio, hashlib, json, mimetypes, re
+          import asyncio, hashlib, html as htmlmod, json, re
           from pathlib import Path
-          from urllib.parse import urlparse, urldefrag, unquote
+          from urllib.parse import urljoin, urlparse, urldefrag, unquote
           from bs4 import BeautifulSoup
           from playwright.async_api import async_playwright
 
@@ -26,9 +26,22 @@ jobs:
           HOSTS = {'perfectpaints.co.za', 'www.perfectpaints.co.za'}
           OUT = Path('backup')
           OUT.mkdir(parents=True, exist_ok=True)
-          seen_pages, queued = set(), [ROOT]
           captured, errors = {}, []
-          pending_tasks = set()
+          page_seen, asset_seen = set(), set()
+          page_queue, asset_queue = asyncio.Queue(), asyncio.Queue()
+          page_queue.put_nowait(ROOT)
+          lock = asyncio.Lock()
+
+          ASSET_EXT = re.compile(r'\.(?:css|js|mjs|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|mp4|webm|mp3|wav|docx?|xlsx?)(?:$|\?)', re.I)
+
+          def normal(url, base=ROOT):
+              if not url: return None
+              url = htmlmod.unescape(str(url)).strip().strip('"\'')
+              if not url or url.startswith(('data:', 'blob:', 'javascript:', 'mailto:', 'tel:', '#')): return None
+              try:
+                  return urldefrag(urljoin(base, url))[0]
+              except Exception:
+                  return None
 
           def safe_path(url, content_type=''):
               p = urlparse(url)
@@ -36,7 +49,7 @@ jobs:
               path = unquote(p.path or '/')
               if path.endswith('/'):
                   path += 'index.html'
-              name = path.rsplit('/', 1)[-1]
+              name = path.rsplit('/',1)[-1]
               if '.' not in name and ('text/html' in content_type or not content_type):
                   path += '.html'
               if p.query:
@@ -46,121 +59,176 @@ jobs:
               path = re.sub(r'[^A-Za-z0-9._/\-]', '_', path).lstrip('/') or 'index.html'
               return OUT / host / path
 
-          async def save_response(resp):
-              url = resp.url
-              if not url.startswith(('http://', 'https://')):
-                  return
-              try:
-                  body = await resp.body()
-              except Exception:
-                  return
-              ctype = (resp.headers.get('content-type') or '').split(';')[0]
+          async def save_bytes(url, body, status, ctype):
               path = safe_path(url, ctype)
               path.parent.mkdir(parents=True, exist_ok=True)
-              try:
-                  path.write_bytes(body)
-                  captured[url] = {'path': str(path), 'status': resp.status, 'content_type': ctype, 'bytes': len(body)}
-              except Exception as e:
-                  errors.append({'url': url, 'error': str(e)})
+              path.write_bytes(body)
+              async with lock:
+                  captured[url] = {'path': str(path), 'status': status, 'content_type': ctype, 'bytes': len(body)}
 
-          def on_response(resp):
-              task = asyncio.create_task(save_response(resp))
-              pending_tasks.add(task)
-              task.add_done_callback(pending_tasks.discard)
+          async def add_asset(url, base=ROOT):
+              u = normal(url, base)
+              if not u or not u.startswith(('http://','https://')): return
+              if u not in asset_seen:
+                  asset_seen.add(u)
+                  await asset_queue.put(u)
 
-          async def seed_sitemaps(context):
-              seeds = set()
-              for sm in ('https://perfectpaints.co.za/wp-sitemap.xml', 'https://perfectpaints.co.za/sitemap_index.xml', 'https://perfectpaints.co.za/sitemap.xml'):
+          async def add_page(url, base=ROOT):
+              u = normal(url, base)
+              if not u or urlparse(u).netloc not in HOSTS: return
+              if ASSET_EXT.search(urlparse(u).path):
+                  await add_asset(u)
+                  return
+              if u not in page_seen:
+                  await page_queue.put(u)
+
+          async def discover_html(text, base):
+              soup = BeautifulSoup(text, 'html.parser')
+              for a in soup.select('a[href]'):
+                  href = a.get('href')
+                  u = normal(href, base)
+                  if u and urlparse(u).netloc in HOSTS:
+                      if ASSET_EXT.search(urlparse(u).path): await add_asset(u)
+                      else: await add_page(u)
+              for tag in soup.find_all(True):
+                  for attr in ('src','data-src','data-lazy-src','data-original','poster','data-bg','data-background-image'):
+                      v = tag.get(attr)
+                      if v: await add_asset(v, base)
+                  for attr in ('srcset','data-srcset'):
+                      v = tag.get(attr)
+                      if v:
+                          for part in v.split(','):
+                              await add_asset(part.strip().split()[0], base)
+                  if tag.get('style'):
+                      for x in re.findall(r'url\(([^)]+)\)', tag.get('style'), re.I):
+                          await add_asset(x, base)
+                  for k, v in tag.attrs.items():
+                      if k.startswith('data-') and isinstance(v, str) and ('http' in v or '/' in v):
+                          for cand in re.findall(r'https?://[^\s"\'<>]+|(?:/[^\s"\'<>]+\.(?:jpg|jpeg|png|gif|webp|avif|svg|ico|mp4|webm|pdf))', v, re.I):
+                              await add_asset(cand, base)
+              for link in soup.select('link[href]'):
+                  rel = ' '.join(link.get('rel') or []).lower()
+                  if any(x in rel for x in ('stylesheet','icon','preload','prefetch','apple-touch')):
+                      await add_asset(link.get('href'), base)
+              for m in soup.find_all('meta'):
+                  v = m.get('content')
+                  if v and (v.startswith(('http://','https://','/')) and ASSET_EXT.search(v)):
+                      await add_asset(v, base)
+              for x in re.findall(r'url\(([^)]+)\)', text, re.I):
+                  await add_asset(x, base)
+
+          async def seed_sitemaps(request):
+              candidates = [
+                  'https://perfectpaints.co.za/wp-sitemap.xml',
+                  'https://perfectpaints.co.za/sitemap_index.xml',
+                  'https://perfectpaints.co.za/sitemap.xml'
+              ]
+              sitemap_seen = set()
+              while candidates and len(sitemap_seen) < 100:
+                  sm = candidates.pop(0)
+                  if sm in sitemap_seen: continue
+                  sitemap_seen.add(sm)
                   try:
-                      r = await context.request.get(sm, timeout=15000)
-                      if r.ok:
-                          text = await r.text()
-                          p = safe_path(sm, r.headers.get('content-type',''))
-                          p.parent.mkdir(parents=True, exist_ok=True)
-                          p.write_text(text, encoding='utf-8')
-                          captured[sm] = {'path': str(p), 'status': r.status, 'content_type': r.headers.get('content-type',''), 'bytes': len(text.encode())}
-                          locs = re.findall(r'<loc>\s*(.*?)\s*</loc>', text, re.I)
-                          for loc in locs:
-                              if 'sitemap' in loc.lower() and loc != sm:
-                                  try:
-                                      sr = await context.request.get(loc, timeout=15000)
-                                      if sr.ok:
-                                          st = await sr.text()
-                                          sp = safe_path(loc, sr.headers.get('content-type',''))
-                                          sp.parent.mkdir(parents=True, exist_ok=True)
-                                          sp.write_text(st, encoding='utf-8')
-                                          captured[loc] = {'path': str(sp), 'status': sr.status, 'content_type': sr.headers.get('content-type',''), 'bytes': len(st.encode())}
-                                          for u in re.findall(r'<loc>\s*(.*?)\s*</loc>', st, re.I):
-                                              if urlparse(u).netloc in HOSTS:
-                                                  seeds.add(urldefrag(u)[0])
-                                  except Exception as e:
-                                      errors.append({'url': loc, 'error': f'sitemap: {e}'})
-                              elif urlparse(loc).netloc in HOSTS:
-                                  seeds.add(urldefrag(loc)[0])
+                      r = await request.get(sm, timeout=15000)
+                      if not r.ok: continue
+                      body = await r.body()
+                      ctype = (r.headers.get('content-type') or '').split(';')[0]
+                      await save_bytes(sm, body, r.status, ctype)
+                      text = body.decode('utf-8', errors='ignore')
+                      for loc in re.findall(r'<loc>\s*(.*?)\s*</loc>', text, re.I):
+                          loc = htmlmod.unescape(loc.strip())
+                          if 'sitemap' in loc.lower(): candidates.append(loc)
+                          elif urlparse(loc).netloc in HOSTS: await add_page(loc)
                   except Exception as e:
                       errors.append({'url': sm, 'error': f'sitemap: {e}'})
-              return seeds
+
+          async def page_worker(request):
+              while True:
+                  url = await page_queue.get()
+                  try:
+                      if url in page_seen or len(page_seen) >= 600:
+                          continue
+                      page_seen.add(url)
+                      r = await request.get(url, timeout=20000)
+                      body = await r.body()
+                      ctype = (r.headers.get('content-type') or '').split(';')[0]
+                      await save_bytes(url, body, r.status, ctype)
+                      if 'html' in ctype or body[:100].lstrip().startswith(b'<'):
+                          await discover_html(body.decode('utf-8', errors='ignore'), url)
+                  except Exception as e:
+                      errors.append({'url': url, 'error': str(e)})
+                  finally:
+                      page_queue.task_done()
+
+          async def asset_worker(request):
+              while True:
+                  url = await asset_queue.get()
+                  try:
+                      r = await request.get(url, timeout=20000)
+                      if r.ok:
+                          body = await r.body()
+                          ctype = (r.headers.get('content-type') or '').split(';')[0]
+                          await save_bytes(url, body, r.status, ctype)
+                          if 'text/css' in ctype or urlparse(url).path.lower().endswith('.css'):
+                              css = body.decode('utf-8', errors='ignore')
+                              for x in re.findall(r'url\(([^)]+)\)', css, re.I): await add_asset(x, url)
+                              for x in re.findall(r'@import\s+(?:url\()?\s*["\']?([^"\')\s;]+)', css, re.I): await add_asset(x, url)
+                  except Exception as e:
+                      errors.append({'url': url, 'error': str(e)})
+                  finally:
+                      asset_queue.task_done()
 
           async def main():
               async with async_playwright() as p:
                   browser = await p.chromium.launch(headless=True, executable_path='/usr/bin/google-chrome', args=['--no-sandbox','--disable-dev-shm-usage'])
                   context = await browser.new_context(
                       user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
-                      viewport={'width':1440,'height':1100},
-                      ignore_https_errors=True
+                      viewport={'width':1440,'height':1100}, ignore_https_errors=True
                   )
                   page = await context.new_page()
-                  page.on('response', on_response)
-
-                  sitemap_urls = await seed_sitemaps(context)
-                  for u in sorted(sitemap_urls):
-                      if u not in queued:
-                          queued.append(u)
-
-                  max_pages = 250
-                  while queued and len(seen_pages) < max_pages:
-                      url = urldefrag(queued.pop(0))[0]
-                      if url in seen_pages or urlparse(url).netloc not in HOSTS:
-                          continue
-                      if re.search(r'\.(pdf|jpg|jpeg|png|gif|webp|avif|svg|zip|mp4|mp3|docx?|xlsx?|css|js|woff2?|ttf|otf)($|\?)', urlparse(url).path, re.I):
-                          continue
-                      seen_pages.add(url)
+                  # Establish normal browser session/cookies and capture homepage lazy-loaded network assets.
+                  pending = set()
+                  async def capture_resp(resp):
                       try:
-                          resp = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
-                          await page.wait_for_timeout(1200)
-                          # Trigger lazy-loaded/background assets across the whole page.
-                          for _ in range(12):
-                              await page.evaluate('window.scrollBy(0, Math.max(700, window.innerHeight * 0.85))')
-                              await page.wait_for_timeout(180)
-                          await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                          await page.wait_for_timeout(900)
-                          await page.evaluate('window.scrollTo(0, 0)')
-                          await page.wait_for_timeout(250)
+                          body = await resp.body()
+                          ctype = (resp.headers.get('content-type') or '').split(';')[0]
+                          await save_bytes(resp.url, body, resp.status, ctype)
+                      except Exception: pass
+                  def on_resp(resp):
+                      t = asyncio.create_task(capture_resp(resp)); pending.add(t); t.add_done_callback(pending.discard)
+                  page.on('response', on_resp)
+                  try:
+                      await page.goto(ROOT, wait_until='domcontentloaded', timeout=30000)
+                      for _ in range(16):
+                          await page.evaluate('window.scrollBy(0, Math.max(700, window.innerHeight * .85))')
+                          await page.wait_for_timeout(120)
+                      await page.wait_for_timeout(700)
+                      html = await page.content()
+                      await discover_html(html, ROOT)
+                  except Exception as e:
+                      errors.append({'url': ROOT, 'error': f'browser: {e}'})
 
-                          html = await page.content()
-                          final_url = page.url
-                          pth = safe_path(final_url, 'text/html')
-                          pth.parent.mkdir(parents=True, exist_ok=True)
-                          pth.write_text(html, encoding='utf-8')
-                          captured[final_url] = {'path': str(pth), 'status': resp.status if resp else None, 'content_type':'text/html', 'bytes': len(html.encode())}
+                  request = context.request
+                  await seed_sitemaps(request)
 
-                          links = await page.eval_on_selector_all('a[href]', 'els => els.map(e => e.href)')
-                          for href in links:
-                              href = urldefrag(href)[0]
-                              u = urlparse(href)
-                              if u.scheme in ('http','https') and u.netloc in HOSTS and href not in seen_pages and href not in queued:
-                                  if not re.search(r'\.(pdf|jpg|jpeg|png|gif|webp|avif|svg|zip|mp4|mp3|docx?|xlsx?)($|\?)', u.path, re.I):
-                                      queued.append(href)
-                      except Exception as e:
-                          errors.append({'url': url, 'error': str(e)})
+                  page_workers = [asyncio.create_task(page_worker(request)) for _ in range(12)]
+                  asset_workers = [asyncio.create_task(asset_worker(request)) for _ in range(16)]
 
-                  if pending_tasks:
-                      await asyncio.gather(*list(pending_tasks), return_exceptions=True)
+                  # Let discovery settle: pages can enqueue more pages/assets; CSS can enqueue more assets.
+                  await page_queue.join()
+                  await asset_queue.join()
+                  await asyncio.sleep(1)
+                  await page_queue.join()
+                  await asset_queue.join()
+                  if pending: await asyncio.gather(*list(pending), return_exceptions=True)
+
+                  for t in page_workers + asset_workers: t.cancel()
+                  await asyncio.gather(*(page_workers + asset_workers), return_exceptions=True)
                   await browser.close()
 
-              (OUT/'capture-manifest.json').write_text(json.dumps({'pages': sorted(seen_pages), 'captured': captured, 'errors': errors}, indent=2), encoding='utf-8')
+              (OUT/'capture-manifest.json').write_text(json.dumps({'pages': sorted(page_seen), 'captured': captured, 'errors': errors}, indent=2), encoding='utf-8')
               (OUT/'file-manifest.txt').write_text('\n'.join(sorted(str(p) for p in OUT.rglob('*') if p.is_file())), encoding='utf-8')
-              print('Pages visited:', len(seen_pages))
+              print('Pages captured:', len(page_seen))
               print('Resources captured:', len(captured))
               print('Files:', sum(1 for p in OUT.rglob('*') if p.is_file()))
               print('Errors:', len(errors))

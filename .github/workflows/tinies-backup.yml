@@ -1,0 +1,37 @@
+name: Tinies Backup
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y wget zip
+      - name: Mirror Tinies
+        run: |
+          mkdir -p backup
+          cd backup
+          wget \
+            --mirror \
+            --page-requisites \
+            --convert-links \
+            --adjust-extension \
+            --no-parent \
+            --domains tinies.com,www.tinies.com \
+            --execute robots=off \
+            --user-agent='Mozilla/5.0' \
+            https://tinies.com/ || true
+          cd ..
+          find backup -type f | sort > backup/file-manifest.txt
+          zip -r tinies-public-website-backup.zip backup
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinies-public-website-backup
+          path: tinies-public-website-backup.zip
+          if-no-files-found: error
+          retention-days: 1
